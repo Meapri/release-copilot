@@ -13,10 +13,20 @@ from types import SimpleNamespace
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PLUGIN_ROOT / "scripts" / "release_copilot.py"
+INSTALL_SCRIPT_PATH = PLUGIN_ROOT / "scripts" / "install_plugin.py"
 
 
 def load_module():
     spec = importlib.util.spec_from_file_location("_release_copilot", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_install_module():
+    spec = importlib.util.spec_from_file_location("_release_copilot_installer", INSTALL_SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -42,6 +52,14 @@ def init_repo(root: Path) -> None:
     run(["git", "commit", "-m", "docs: update release docs"], root)
 
 
+def init_release_tool_files(root: Path) -> None:
+    (root / ".changeset").mkdir()
+    (root / ".changeset" / "config.json").write_text("{}\n", encoding="utf-8")
+    (root / ".goreleaser.yaml").write_text("version: 2\n", encoding="utf-8")
+    (root / "release-please-config.json").write_text("{}\n", encoding="utf-8")
+    (root / ".releaserc.json").write_text("{}\n", encoding="utf-8")
+
+
 class ReleaseCopilotTests(unittest.TestCase):
     def test_collect_snapshot_detects_versions_and_commits(self):
         module = load_module()
@@ -58,6 +76,7 @@ class ReleaseCopilotTests(unittest.TestCase):
         self.assertEqual(snapshot.recommended_bump, "patch")
         self.assertEqual(snapshot.recommended_version, "1.2.4")
         self.assertEqual(snapshot.change_categories["docs"], ["update release docs"])
+        self.assertEqual(snapshot.release_tools, [])
 
     def test_render_draft_contains_release_sections(self):
         module = load_module()
@@ -74,6 +93,18 @@ class ReleaseCopilotTests(unittest.TestCase):
         self.assertIn("### Documentation", draft)
         self.assertIn("update release docs", draft)
         self.assertIn("Recommended next version: `1.2.4`", draft)
+        self.assertIn("Detected release tools:", draft)
+
+    def test_detect_release_tools(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            init_release_tool_files(root)
+
+            tools = module.detect_release_tools(root)
+
+        self.assertEqual(tools, ["semantic-release", "release-please", "changesets", "goreleaser"])
 
     def test_check_command_records_failure(self):
         module = load_module()
@@ -163,6 +194,19 @@ class ReleaseCopilotTests(unittest.TestCase):
 
         self.assertEqual(categories["other"], ["M\tREADME.md", "A\tCHANGELOG.md"])
 
+    def test_dirty_working_tree_falls_back_to_status_when_range_is_empty(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "UNTRACKED.md").write_text("draft\n", encoding="utf-8")
+
+            snapshot = module.collect_snapshot(repo=root, base_ref=head)
+
+        self.assertIn("UNTRACKED.md", snapshot.changed_files)
+        self.assertIn("UNTRACKED.md", snapshot.change_categories["other"][0])
+
     def test_artifacts_write_expected_files(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,6 +277,68 @@ class ReleaseCopilotTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("## v1.2.4 - 2026-06-01", proc.stdout)
         self.assertIn("### Documentation", proc.stdout)
+
+    def test_cli_doctor_outputs_detected_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            init_release_tool_files(root)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "doctor",
+                    "--repo",
+                    str(root),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Detected release tools: semantic-release, release-please, changesets, goreleaser", proc.stdout)
+
+
+class ReleaseCopilotInstallerTests(unittest.TestCase):
+    def test_personal_marketplace_entry_uses_home_relative_path(self):
+        module = load_install_module()
+        home = Path("/Users/tester")
+        repo = home / "plugins" / "release-copilot"
+
+        entry = module.personal_marketplace_entry(repo, home)
+
+        self.assertEqual(entry["name"], "release-copilot")
+        self.assertEqual(entry["source"]["path"], "./plugins/release-copilot")
+        self.assertEqual(entry["policy"]["authentication"], "ON_INSTALL")
+
+    def test_personal_marketplace_entry_rejects_external_repo(self):
+        module = load_install_module()
+
+        with self.assertRaises(ValueError):
+            module.personal_marketplace_entry(Path("/opt/release-copilot"), Path("/Users/tester"))
+
+    def test_upsert_personal_marketplace_preserves_existing_entries(self):
+        module = load_install_module()
+        data = {
+            "name": "personal",
+            "interface": {"displayName": "My Plugins"},
+            "plugins": [
+                {"name": "other-plugin", "source": {"source": "local", "path": "./plugins/other-plugin"}},
+                {"name": "release-copilot", "source": {"source": "local", "path": "./old"}},
+            ],
+        }
+        entry = module.personal_marketplace_entry(
+            Path("/Users/tester/plugins/release-copilot"),
+            Path("/Users/tester"),
+        )
+
+        updated = module.upsert_personal_marketplace(data, entry)
+
+        self.assertEqual(updated["interface"]["displayName"], "My Plugins")
+        self.assertEqual(len(updated["plugins"]), 2)
+        self.assertEqual(updated["plugins"][0]["name"], "other-plugin")
+        self.assertEqual(updated["plugins"][1]["source"]["path"], "./plugins/release-copilot")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@ Options:
 
 The draft includes conventional-commit categories, a recommended semver bump,
 the recommended next version when a current version is detected, and a GitHub
-compare URL when the repository has a GitHub `origin` remote.
+compare URL when the repository has a GitHub `origin` remote. It also lists
+detected release automation tools such as semantic-release, release-please,
+Changesets, and GoReleaser.
 
 ## Snapshot
 
@@ -32,6 +34,17 @@ python3 scripts/release_copilot.py snapshot --repo . --format json
 ```
 
 `--format markdown` returns the same draft-style markdown as `draft`.
+
+## Doctor
+
+Use `doctor` to check local prerequisites and detect existing release tooling:
+
+```bash
+python3 scripts/release_copilot.py doctor --repo .
+```
+
+This reports Python, git, gh, Codex CLI, repo status, and detected release
+automation.
 
 ## Artifacts
 

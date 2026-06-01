@@ -17,6 +17,7 @@ Use Release Copilot for:
 - Conventional commit classification
 - Recommended semantic version bumps
 - GitHub compare URLs
+- Detecting existing release automation such as semantic-release, release-please, Changesets, or GoReleaser
 - Release readiness snapshots
 - Test or validation summaries for release artifacts
 - Writing PR/release/changelog artifact files
@@ -58,6 +59,14 @@ Use `snapshot` when Codex needs structured data:
 ```bash
 python3 /Users/naen/plugins/release-copilot/scripts/release_copilot.py snapshot --repo . --format json
 ```
+
+Use `doctor` before deeper release work in unfamiliar repos:
+
+```bash
+python3 /Users/naen/plugins/release-copilot/scripts/release_copilot.py doctor --repo .
+```
+
+If the snapshot or doctor detects semantic-release, release-please, Changesets, or GoReleaser, treat Release Copilot as a local reviewer/drafter unless the user explicitly asks to bypass or complement that workflow.
 
 Use `artifacts` when the user wants files:
 

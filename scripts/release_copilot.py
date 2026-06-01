@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -63,6 +64,7 @@ class ReleaseSnapshot:
     compare_range: str
     remote_url: str
     compare_url: str
+    release_tools: list[str]
     status_short: str
     changed_files: str
     diff_stat: str
@@ -132,6 +134,77 @@ def compare_url(remote_url: str, base_ref: str, head_ref: str) -> str:
     if not remote_url.startswith("https://github.com/") or not base_ref:
         return ""
     return f"{remote_url}/compare/{base_ref}...{head_ref}"
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _package_json_tool_names(repo: Path) -> set[str]:
+    path = repo / "package.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    names: set[str] = set()
+    for section in ("dependencies", "devDependencies", "peerDependencies"):
+        values = data.get(section, {})
+        if isinstance(values, dict):
+            names.update(values)
+    scripts = data.get("scripts", {})
+    if isinstance(scripts, dict):
+        names.update(str(value) for value in scripts.values())
+    return names
+
+
+def _workflow_contains(repo: Path, needle: str) -> bool:
+    workflows = repo / ".github" / "workflows"
+    if not workflows.is_dir():
+        return False
+    for path in workflows.glob("*"):
+        if path.suffix.lower() not in {".yml", ".yaml"}:
+            continue
+        if needle.lower() in _read_text(path).lower():
+            return True
+    return False
+
+
+def detect_release_tools(repo: Path) -> list[str]:
+    tools: list[str] = []
+    package_names = _package_json_tool_names(repo)
+
+    semantic_release_files = (
+        ".releaserc",
+        ".releaserc.json",
+        ".releaserc.yml",
+        ".releaserc.yaml",
+        "release.config.js",
+        "release.config.cjs",
+        "release.config.mjs",
+    )
+    if any((repo / name).exists() for name in semantic_release_files) or any(
+        "semantic-release" in name for name in package_names
+    ):
+        tools.append("semantic-release")
+
+    if (
+        (repo / "release-please-config.json").exists()
+        or (repo / ".release-please-manifest.json").exists()
+        or _workflow_contains(repo, "release-please")
+    ):
+        tools.append("release-please")
+
+    if (repo / ".changeset").is_dir() or any(name.startswith("@changesets/") for name in package_names):
+        tools.append("changesets")
+
+    goreleaser_files = (".goreleaser.yml", ".goreleaser.yaml", "goreleaser.yml", "goreleaser.yaml")
+    if any((repo / name).exists() for name in goreleaser_files) or _workflow_contains(repo, "goreleaser"):
+        tools.append("goreleaser")
+
+    return tools
 
 
 def default_base(repo: Path) -> str:
@@ -299,7 +372,12 @@ def collect_snapshot(
     log_range = diff_range or ["--max-count=20"]
     check_results = [run_check(repo, command, timeout_sec=check_timeout_sec) for command in checks or []]
     commits = git_output(repo, ["log", "--oneline", *log_range])
+    status_short = git_output(repo, ["status", "--short"])
     changed_files = git_output(repo, ["diff", "--name-status", *diff_range])
+    diff_stat = git_output(repo, ["diff", "--stat", *diff_range])
+    if status_short and not changed_files:
+        changed_files = status_short
+        diff_stat = git_output(repo, ["diff", "--stat"]) or "[working tree has untracked or staged changes]"
     categories = categorize_commits(commits) or categorize_changed_files(changed_files)
     bump = recommended_bump_from_categories(categories)
     latest = latest_tag(repo)
@@ -315,9 +393,10 @@ def collect_snapshot(
         compare_range=diff_range[0] if diff_range else "working tree",
         remote_url=remote,
         compare_url=compare_url(remote, base, head_ref),
-        status_short=git_output(repo, ["status", "--short"]),
+        release_tools=detect_release_tools(repo),
+        status_short=status_short,
         changed_files=changed_files,
-        diff_stat=git_output(repo, ["diff", "--stat", *diff_range]),
+        diff_stat=diff_stat,
         commits=commits,
         change_categories=categories,
         recommended_bump=bump,
@@ -397,6 +476,7 @@ def render_draft(snapshot: ReleaseSnapshot, *, title: str = "", version: str = "
         f"- Base: `{snapshot.base_ref or '[not detected]'}`",
         f"- Compare range: `{snapshot.compare_range}`",
         f"- Compare URL: {snapshot.compare_url or '[not available]'}",
+        f"- Detected release tools: {', '.join(snapshot.release_tools) if snapshot.release_tools else '[none]'}",
         f"- Latest tag: `{snapshot.latest_tag or '[none]'}`",
         f"- Version: `{version_text}`",
         f"- Recommended bump: `{snapshot.recommended_bump}`",
@@ -573,6 +653,36 @@ def run_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_doctor(args: argparse.Namespace) -> int:
+    failures = 0
+    repo = Path(args.repo).expanduser()
+    print(f"Python: {sys.version.split()[0]}")
+    if sys.version_info < (3, 9):
+        print("Python check: requires 3.9+")
+        failures += 1
+    else:
+        print("Python check: ok")
+    print(f"git: {shutil.which('git') or 'not found'}")
+    if not shutil.which("git"):
+        failures += 1
+    print(f"gh: {shutil.which('gh') or 'not found'}")
+    print(f"codex: {shutil.which('codex') or 'not found'}")
+    try:
+        root = repo_root(repo)
+        print(f"Repo: {root}")
+        print(f"Branch: {git_output(root, ['branch', '--show-current']) or '[detached]'}")
+        tools = detect_release_tools(root)
+        print(f"Detected release tools: {', '.join(tools) if tools else '[none]'}")
+        if git_output(root, ["status", "--short"]):
+            print("Working tree: dirty")
+        else:
+            print("Working tree: clean")
+    except SystemExit as exc:
+        print(str(exc))
+        failures += 1
+    return 0 if failures == 0 else 1
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".", help="Git repository path.")
     parser.add_argument("--base", default="", help="Base ref. Defaults to upstream merge-base or latest tag.")
@@ -613,6 +723,9 @@ def parse_args() -> argparse.Namespace:
     changelog_parser.add_argument("--file", default="CHANGELOG.md")
     changelog_parser.add_argument("--write", action="store_true")
 
+    doctor_parser = subcommands.add_parser("doctor", help="Check local release-copilot prerequisites.")
+    doctor_parser.add_argument("--repo", default=".")
+
     apply_parser = subcommands.add_parser("apply", help="Plan or execute tag and GitHub release commands.")
     apply_parser.add_argument("--repo", default=".")
     apply_parser.add_argument("--tag", default="")
@@ -630,6 +743,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.command == "doctor":
+        return run_doctor(args)
     if args.command in {"snapshot", "draft", "artifacts", "changelog"}:
         snapshot = collect_snapshot(
             repo=Path(args.repo).expanduser(),
