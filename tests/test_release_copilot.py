@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -37,7 +39,7 @@ def init_repo(root: Path) -> None:
     run(["git", "tag", "v1.2.2"], root)
     (root / "README.md").write_text("# Demo\n\nUpdated release docs.\n", encoding="utf-8")
     run(["git", "add", "README.md"], root)
-    run(["git", "commit", "-m", "Update release docs"], root)
+    run(["git", "commit", "-m", "docs: update release docs"], root)
 
 
 class ReleaseCopilotTests(unittest.TestCase):
@@ -50,9 +52,12 @@ class ReleaseCopilotTests(unittest.TestCase):
             snapshot = module.collect_snapshot(repo=root, base_ref="v1.2.2")
 
         self.assertEqual(snapshot.latest_tag, "v1.2.2")
-        self.assertIn("Update release docs", snapshot.commits)
+        self.assertIn("docs: update release docs", snapshot.commits)
         self.assertEqual(snapshot.versions[0].path, "package.json")
         self.assertEqual(snapshot.versions[0].version, "1.2.3")
+        self.assertEqual(snapshot.recommended_bump, "patch")
+        self.assertEqual(snapshot.recommended_version, "1.2.4")
+        self.assertEqual(snapshot.change_categories["docs"], ["update release docs"])
 
     def test_render_draft_contains_release_sections(self):
         module = load_module()
@@ -66,7 +71,9 @@ class ReleaseCopilotTests(unittest.TestCase):
         self.assertIn("# Release Copilot Draft", draft)
         self.assertIn("## PR Description Draft", draft)
         self.assertIn("## Release Notes Draft", draft)
-        self.assertIn("Update release docs", draft)
+        self.assertIn("### Documentation", draft)
+        self.assertIn("update release docs", draft)
+        self.assertIn("Recommended next version: `1.2.4`", draft)
 
     def test_check_command_records_failure(self):
         module = load_module()
@@ -101,6 +108,78 @@ class ReleaseCopilotTests(unittest.TestCase):
         self.assertIn("git push origin v1.2.3", commands)
         self.assertIn("gh release create v1.2.3", commands)
 
+    def test_github_release_requires_tag(self):
+        module = load_module()
+        args = SimpleNamespace(
+            tag="",
+            title="Release 1.2.3",
+            message="",
+            push_tag=False,
+            github_release=True,
+            notes_file="RELEASE_NOTES.md",
+            notes="",
+        )
+
+        with self.assertRaises(SystemExit):
+            module.planned_apply_commands(args)
+
+    def test_dry_run_overrides_execute(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            args = SimpleNamespace(
+                repo=str(root),
+                tag="v9.9.9",
+                title="",
+                message="",
+                push_tag=False,
+                github_release=False,
+                notes_file="",
+                notes="",
+                execute=True,
+                dry_run=True,
+                allow_dirty=False,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = module.run_apply(args)
+
+        self.assertEqual(code, 0)
+
+    def test_changelog_update_inserts_after_title(self):
+        module = load_module()
+        entry = "## v1.2.3 - 2026-06-01\n\n### Fixed\n- Bug\n"
+
+        updated = module.update_changelog_text("# Changelog\n\n## old\n\n- Old\n", entry)
+
+        self.assertTrue(updated.startswith("# Changelog\n\n## v1.2.3 - 2026-06-01"))
+        self.assertIn("## old", updated)
+
+    def test_changed_files_fallback_when_no_commits(self):
+        module = load_module()
+
+        categories = module.categorize_changed_files("M\tREADME.md\nA\tCHANGELOG.md\n")
+
+        self.assertEqual(categories["other"], ["M\tREADME.md", "A\tCHANGELOG.md"])
+
+    def test_artifacts_write_expected_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            init_repo(root)
+            snapshot = module.collect_snapshot(repo=root, base_ref="v1.2.2")
+            output_dir = Path(tmp) / "artifacts"
+
+            written = module.write_artifacts(snapshot, output_dir=output_dir, version="1.2.4", tag="v1.2.4")
+
+        names = {path.name for path in written}
+        self.assertIn("PR_DESCRIPTION.md", names)
+        self.assertIn("RELEASE_NOTES.md", names)
+        self.assertIn("CHANGELOG_ENTRY.md", names)
+        self.assertIn("RELEASE_SNAPSHOT.json", names)
+
     def test_cli_draft_outputs_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -124,7 +203,36 @@ class ReleaseCopilotTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0)
         self.assertIn("Release Copilot Draft", proc.stdout)
-        self.assertIn("Update release docs", proc.stdout)
+        self.assertIn("update release docs", proc.stdout)
+
+    def test_cli_changelog_outputs_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_repo(root)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "changelog",
+                    "--repo",
+                    str(root),
+                    "--base",
+                    "v1.2.2",
+                    "--version",
+                    "1.2.4",
+                    "--tag",
+                    "v1.2.4",
+                    "--date",
+                    "2026-06-01",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("## v1.2.4 - 2026-06-01", proc.stdout)
+        self.assertIn("### Documentation", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+from datetime import date
 import json
-import os
 from pathlib import Path
 import re
 import shlex
@@ -22,6 +22,20 @@ VERSION_FILE_PATTERNS = (
     (".codex-plugin/plugin.json", re.compile(r'"version"\s*:\s*"([^"]+)"')),
     ("VERSION", re.compile(r"^\s*([^\s]+)\s*$")),
 )
+
+CHANGE_CATEGORY_TITLES = {
+    "breaking": "Breaking",
+    "features": "Added",
+    "fixes": "Fixed",
+    "performance": "Performance",
+    "docs": "Documentation",
+    "tests": "Tests",
+    "chores": "Chores",
+    "other": "Other",
+}
+
+CONVENTIONAL_RE = re.compile(r"^(?P<type>[A-Za-z]+)(?:\([^)]+\))?(?P<breaking>!)?:\s*(?P<body>.+)$")
+SEMVER_RE = re.compile(r"^v?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)")
 
 
 @dataclass
@@ -47,10 +61,15 @@ class ReleaseSnapshot:
     base_ref: str
     latest_tag: str
     compare_range: str
+    remote_url: str
+    compare_url: str
     status_short: str
     changed_files: str
     diff_stat: str
     commits: str
+    change_categories: dict[str, list[str]]
+    recommended_bump: str
+    recommended_version: str
     versions: list[VersionInfo]
     checks: list[CommandResult]
 
@@ -90,6 +109,31 @@ def latest_tag(repo: Path) -> str:
     return git_output(repo, ["describe", "--tags", "--abbrev=0"])
 
 
+def current_remote_url(repo: Path) -> str:
+    remote = git_output(repo, ["remote", "get-url", "origin"])
+    return normalize_remote_url(remote)
+
+
+def normalize_remote_url(remote: str) -> str:
+    remote = remote.strip()
+    if not remote:
+        return ""
+    if remote.startswith("git@github.com:"):
+        path = remote.removeprefix("git@github.com:")
+        return "https://github.com/" + path.removesuffix(".git")
+    if remote.startswith("https://github.com/"):
+        return remote.removesuffix(".git")
+    if remote.startswith("http://github.com/"):
+        return "https://" + remote.removeprefix("http://").removesuffix(".git")
+    return remote
+
+
+def compare_url(remote_url: str, base_ref: str, head_ref: str) -> str:
+    if not remote_url.startswith("https://github.com/") or not base_ref:
+        return ""
+    return f"{remote_url}/compare/{base_ref}...{head_ref}"
+
+
 def default_base(repo: Path) -> str:
     upstream = git_output(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
     if upstream:
@@ -104,6 +148,98 @@ def compare_args(base_ref: str, head_ref: str) -> list[str]:
     if base_ref:
         return [f"{base_ref}..{head_ref}"]
     return []
+
+
+def strip_commit_hash(commit: str) -> str:
+    return re.sub(r"^[0-9a-f]{6,40}\s+", "", commit.strip())
+
+
+def categorize_commit(message: str) -> tuple[str, str, bool]:
+    message = strip_commit_hash(message)
+    match = CONVENTIONAL_RE.match(message)
+    if not match:
+        breaking = "BREAKING CHANGE" in message or "breaking:" in message.lower()
+        return ("breaking" if breaking else "other", message, breaking)
+
+    commit_type = match.group("type").lower()
+    body = match.group("body").strip()
+    breaking = bool(match.group("breaking")) or "BREAKING CHANGE" in message
+    if breaking:
+        return "breaking", body, True
+    if commit_type == "feat":
+        return "features", body, False
+    if commit_type in {"fix", "bugfix", "hotfix"}:
+        return "fixes", body, False
+    if commit_type in {"perf", "speed"}:
+        return "performance", body, False
+    if commit_type == "docs":
+        return "docs", body, False
+    if commit_type in {"test", "tests"}:
+        return "tests", body, False
+    if commit_type in {"chore", "build", "ci", "refactor", "style"}:
+        return "chores", body, False
+    return "other", body, False
+
+
+def categorize_commits(commits: str) -> dict[str, list[str]]:
+    categories = {key: [] for key in CHANGE_CATEGORY_TITLES}
+    for line in commits.splitlines():
+        if not line.strip():
+            continue
+        category, body, _breaking = categorize_commit(line)
+        categories.setdefault(category, []).append(body)
+    return {key: value for key, value in categories.items() if value}
+
+
+def categorize_changed_files(changed_files: str) -> dict[str, list[str]]:
+    items: list[str] = []
+    for line in changed_files.splitlines():
+        if line.strip():
+            items.append(line.strip())
+    return {"other": items[:20]} if items else {}
+
+
+def recommended_bump_from_categories(categories: dict[str, list[str]]) -> str:
+    if categories.get("breaking"):
+        return "major"
+    if categories.get("features"):
+        return "minor"
+    if any(categories.get(key) for key in ("fixes", "performance", "docs", "tests", "chores", "other")):
+        return "patch"
+    return "none"
+
+
+def parse_semver(version: str) -> tuple[int, int, int] | None:
+    match = SEMVER_RE.match(version.strip())
+    if not match:
+        return None
+    return int(match.group("major")), int(match.group("minor")), int(match.group("patch"))
+
+
+def bump_version(version: str, bump: str) -> str:
+    parsed = parse_semver(version)
+    if not parsed or bump == "none":
+        return ""
+    major, minor, patch = parsed
+    prefix = "v" if version.strip().startswith("v") else ""
+    if bump == "major":
+        major += 1
+        minor = 0
+        patch = 0
+    elif bump == "minor":
+        minor += 1
+        patch = 0
+    elif bump == "patch":
+        patch += 1
+    else:
+        return ""
+    return f"{prefix}{major}.{minor}.{patch}"
+
+
+def detected_primary_version(versions: list[VersionInfo], latest: str) -> str:
+    if versions:
+        return versions[0].version
+    return latest
 
 
 def version_infos(repo: Path) -> list[VersionInfo]:
@@ -162,18 +298,31 @@ def collect_snapshot(
     diff_range = compare_args(base, head_ref)
     log_range = diff_range or ["--max-count=20"]
     check_results = [run_check(repo, command, timeout_sec=check_timeout_sec) for command in checks or []]
+    commits = git_output(repo, ["log", "--oneline", *log_range])
+    changed_files = git_output(repo, ["diff", "--name-status", *diff_range])
+    categories = categorize_commits(commits) or categorize_changed_files(changed_files)
+    bump = recommended_bump_from_categories(categories)
+    latest = latest_tag(repo)
+    versions = version_infos(repo)
+    primary_version = detected_primary_version(versions, latest)
+    remote = current_remote_url(repo)
     return ReleaseSnapshot(
         repo_root=str(repo),
         branch=git_output(repo, ["branch", "--show-current"]),
         head=git_output(repo, ["rev-parse", "--short", head_ref]),
         base_ref=base,
-        latest_tag=latest_tag(repo),
+        latest_tag=latest,
         compare_range=diff_range[0] if diff_range else "working tree",
+        remote_url=remote,
+        compare_url=compare_url(remote, base, head_ref),
         status_short=git_output(repo, ["status", "--short"]),
-        changed_files=git_output(repo, ["diff", "--name-status", *diff_range]),
+        changed_files=changed_files,
         diff_stat=git_output(repo, ["diff", "--stat", *diff_range]),
-        commits=git_output(repo, ["log", "--oneline", *log_range]),
-        versions=version_infos(repo),
+        commits=commits,
+        change_categories=categories,
+        recommended_bump=bump,
+        recommended_version=bump_version(primary_version, bump),
+        versions=versions,
         checks=check_results,
     )
 
@@ -181,10 +330,9 @@ def collect_snapshot(
 def parse_change_lines(snapshot: ReleaseSnapshot) -> list[str]:
     lines: list[str] = []
     for commit in snapshot.commits.splitlines():
-        text = commit.strip()
+        text = strip_commit_hash(commit)
         if not text:
             continue
-        text = re.sub(r"^[0-9a-f]{6,40}\s+", "", text)
         lines.append(text)
     if lines:
         return lines[:12]
@@ -220,11 +368,25 @@ def markdown_list(items: list[str], fallback: str) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def render_category_sections(categories: dict[str, list[str]], *, fallback: str) -> str:
+    if not categories:
+        return markdown_list([], fallback)
+    sections: list[str] = []
+    for key, title in CHANGE_CATEGORY_TITLES.items():
+        items = categories.get(key)
+        if not items:
+            continue
+        sections.append(f"### {title}\n{markdown_list(items, fallback)}")
+    return "\n\n".join(sections)
+
+
 def render_draft(snapshot: ReleaseSnapshot, *, title: str = "", version: str = "", tag: str = "") -> str:
     change_lines = parse_change_lines(snapshot)
-    release_title = title or f"Release {version or tag or snapshot.head}"
+    selected_version = version or snapshot.recommended_version
+    release_title = title or f"Release {selected_version or tag or snapshot.head}"
     version_text = version_summary(snapshot, version)
-    tag_text = tag or (f"v{version}" if version else "[tag not selected]")
+    tag_text = tag or (f"v{selected_version}" if selected_version and not selected_version.startswith("v") else selected_version) or "[tag not selected]"
+    category_sections = render_category_sections(snapshot.change_categories, fallback="Describe notable changes.")
 
     sections = [
         "# Release Copilot Draft",
@@ -234,8 +396,11 @@ def render_draft(snapshot: ReleaseSnapshot, *, title: str = "", version: str = "
         f"- Head: `{snapshot.head}`",
         f"- Base: `{snapshot.base_ref or '[not detected]'}`",
         f"- Compare range: `{snapshot.compare_range}`",
+        f"- Compare URL: {snapshot.compare_url or '[not available]'}",
         f"- Latest tag: `{snapshot.latest_tag or '[none]'}`",
         f"- Version: `{version_text}`",
+        f"- Recommended bump: `{snapshot.recommended_bump}`",
+        f"- Recommended next version: `{snapshot.recommended_version or '[not detected]'}`",
         "",
         "## Working Tree",
         "```text",
@@ -258,6 +423,9 @@ def render_draft(snapshot: ReleaseSnapshot, *, title: str = "", version: str = "
         "## PR Description Draft",
         f"### Summary\n{markdown_list(change_lines[:5], 'Summarize the main change.')}",
         "",
+        "### Changes",
+        category_sections,
+        "",
         "### Validation",
         check_summary(snapshot.checks),
         "",
@@ -267,21 +435,86 @@ def render_draft(snapshot: ReleaseSnapshot, *, title: str = "", version: str = "
         "",
         "## Release Notes Draft",
         f"### {release_title}",
-        markdown_list(change_lines, "Describe user-facing changes."),
+        category_sections,
         "",
         "### Compatibility",
         "- [ ] Add breaking changes, migration notes, or mark as none.",
         "",
         "## Changelog Entry Draft",
         f"## {tag_text} - [date]",
-        "### Changed",
-        markdown_list(change_lines, "Describe notable changes."),
+        category_sections,
         "",
         "## Suggested Dry-Run Commands",
         f"- Tag: `python3 scripts/release_copilot.py apply --tag {shlex.quote(tag_text)} --dry-run`",
-        "- GitHub release: `python3 scripts/release_copilot.py apply --github-release --notes-file RELEASE_NOTES.md --dry-run`",
+        f"- GitHub release: `python3 scripts/release_copilot.py apply --tag {shlex.quote(tag_text)} --github-release --notes-file RELEASE_NOTES.md --dry-run`",
     ]
     return "\n".join(sections).strip() + "\n"
+
+
+def section_between(markdown: str, start: str, end: str) -> str:
+    start_index = markdown.find(start)
+    if start_index == -1:
+        return ""
+    start_index += len(start)
+    end_index = markdown.find(end, start_index)
+    if end_index == -1:
+        end_index = len(markdown)
+    return markdown[start_index:end_index].strip() + "\n"
+
+
+def artifacts_from_draft(draft: str) -> dict[str, str]:
+    return {
+        "PR_DESCRIPTION.md": section_between(draft, "## PR Description Draft", "## Release Notes Draft"),
+        "RELEASE_NOTES.md": section_between(draft, "## Release Notes Draft", "## Changelog Entry Draft"),
+        "CHANGELOG_ENTRY.md": section_between(draft, "## Changelog Entry Draft", "## Suggested Dry-Run Commands"),
+        "RELEASE_DRAFT.md": draft,
+    }
+
+
+def write_artifacts(
+    snapshot: ReleaseSnapshot,
+    *,
+    output_dir: Path,
+    title: str = "",
+    version: str = "",
+    tag: str = "",
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    draft = render_draft(snapshot, title=title, version=version, tag=tag)
+    artifacts = artifacts_from_draft(draft)
+    artifacts["RELEASE_SNAPSHOT.json"] = snapshot_to_json(snapshot) + "\n"
+    written: list[Path] = []
+    for filename, content in artifacts.items():
+        path = output_dir / filename
+        path.write_text(content, encoding="utf-8")
+        written.append(path)
+    return written
+
+
+def render_changelog_entry(snapshot: ReleaseSnapshot, *, version: str = "", tag: str = "", entry_date: str = "") -> str:
+    selected_version = version or snapshot.recommended_version or tag or snapshot.head
+    selected_date = entry_date or date.today().isoformat()
+    heading = tag or (f"v{selected_version}" if selected_version and not selected_version.startswith("v") else selected_version)
+    return (
+        f"## {heading} - {selected_date}\n\n"
+        + render_category_sections(snapshot.change_categories, fallback="Describe notable changes.")
+        + "\n"
+    )
+
+
+def update_changelog_text(existing: str, entry: str) -> str:
+    if not existing.strip():
+        return "# Changelog\n\n" + entry.strip() + "\n"
+    lines = existing.splitlines()
+    insert_at = 0
+    if lines and lines[0].lstrip().startswith("# "):
+        insert_at = 1
+        while insert_at < len(lines) and not lines[insert_at].strip():
+            insert_at += 1
+    before = "\n".join(lines[:insert_at]).rstrip()
+    after = "\n".join(lines[insert_at:]).lstrip()
+    parts = [part for part in (before, entry.strip(), after) if part]
+    return "\n\n".join(parts) + "\n"
 
 
 def snapshot_to_json(snapshot: ReleaseSnapshot) -> str:
@@ -297,6 +530,8 @@ def write_output(text: str, output: str) -> None:
 
 def planned_apply_commands(args: argparse.Namespace) -> list[list[str]]:
     commands: list[list[str]] = []
+    if args.github_release and not args.tag:
+        raise SystemExit("--tag is required when --github-release is selected.")
     if args.tag:
         message = args.message or f"Release {args.tag}"
         commands.append(["git", "tag", "-a", args.tag, "-m", message])
@@ -325,9 +560,11 @@ def render_commands(commands: list[list[str]]) -> str:
 def run_apply(args: argparse.Namespace) -> int:
     repo = repo_root(Path(args.repo).expanduser())
     commands = planned_apply_commands(args)
-    if not args.execute:
+    if args.dry_run or not args.execute:
         print(render_commands(commands), end="")
         return 0
+    if not args.allow_dirty and git_output(repo, ["status", "--short"]):
+        raise SystemExit("Working tree is dirty. Commit/stash changes or pass --allow-dirty.")
     for command in commands:
         print("$ " + " ".join(shlex.quote(part) for part in command), file=sys.stderr)
         proc = subprocess.run(command, cwd=str(repo), check=False)
@@ -359,6 +596,22 @@ def parse_args() -> argparse.Namespace:
     draft_parser.add_argument("--version", default="")
     draft_parser.add_argument("--tag", default="")
     draft_parser.add_argument("--output", default="")
+    draft_parser.add_argument("--artifact-dir", default="")
+
+    artifacts_parser = subcommands.add_parser("artifacts", help="Write release artifact files.")
+    add_common_args(artifacts_parser)
+    artifacts_parser.add_argument("--title", default="")
+    artifacts_parser.add_argument("--version", default="")
+    artifacts_parser.add_argument("--tag", default="")
+    artifacts_parser.add_argument("--output-dir", default="release-artifacts")
+
+    changelog_parser = subcommands.add_parser("changelog", help="Render or update a changelog entry.")
+    add_common_args(changelog_parser)
+    changelog_parser.add_argument("--version", default="")
+    changelog_parser.add_argument("--tag", default="")
+    changelog_parser.add_argument("--date", default="")
+    changelog_parser.add_argument("--file", default="CHANGELOG.md")
+    changelog_parser.add_argument("--write", action="store_true")
 
     apply_parser = subcommands.add_parser("apply", help="Plan or execute tag and GitHub release commands.")
     apply_parser.add_argument("--repo", default=".")
@@ -371,12 +624,13 @@ def parse_args() -> argparse.Namespace:
     apply_parser.add_argument("--notes", default="")
     apply_parser.add_argument("--execute", action="store_true")
     apply_parser.add_argument("--dry-run", action="store_true")
+    apply_parser.add_argument("--allow-dirty", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.command in {"snapshot", "draft"}:
+    if args.command in {"snapshot", "draft", "artifacts", "changelog"}:
         snapshot = collect_snapshot(
             repo=Path(args.repo).expanduser(),
             base_ref=args.base,
@@ -388,10 +642,38 @@ def main() -> int:
             output = snapshot_to_json(snapshot) + "\n" if args.format == "json" else render_draft(snapshot)
             write_output(output, args.output)
             return 0
-        write_output(
-            render_draft(snapshot, title=args.title, version=args.version, tag=args.tag),
-            args.output,
-        )
+        if args.command == "draft":
+            draft = render_draft(snapshot, title=args.title, version=args.version, tag=args.tag)
+            if args.artifact_dir:
+                write_artifacts(
+                    snapshot,
+                    output_dir=Path(args.artifact_dir).expanduser(),
+                    title=args.title,
+                    version=args.version,
+                    tag=args.tag,
+                )
+            write_output(draft, args.output)
+            return 0
+        if args.command == "artifacts":
+            written = write_artifacts(
+                snapshot,
+                output_dir=Path(args.output_dir).expanduser(),
+                title=args.title,
+                version=args.version,
+                tag=args.tag,
+            )
+            print("\n".join(str(path) for path in written))
+            return 0
+        entry = render_changelog_entry(snapshot, version=args.version, tag=args.tag, entry_date=args.date)
+        if args.write:
+            changelog_path = Path(args.file).expanduser()
+            if not changelog_path.is_absolute():
+                changelog_path = Path(snapshot.repo_root) / changelog_path
+            existing = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else ""
+            changelog_path.write_text(update_changelog_text(existing, entry), encoding="utf-8")
+            print(str(changelog_path))
+            return 0
+        print(entry, end="")
         return 0
     if args.command == "apply":
         return run_apply(args)

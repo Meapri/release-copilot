@@ -14,8 +14,13 @@ Use Release Copilot for:
 - PR descriptions and reviewer notes from local git changes
 - Release notes and changelog entries
 - Version and tag planning
+- Conventional commit classification
+- Recommended semantic version bumps
+- GitHub compare URLs
 - Release readiness snapshots
 - Test or validation summaries for release artifacts
+- Writing PR/release/changelog artifact files
+- Updating changelog entries
 - Dry-run GitHub release plans
 - Executing tags or GitHub releases only after explicit user approval
 
@@ -52,6 +57,25 @@ Use `snapshot` when Codex needs structured data:
 
 ```bash
 python3 /Users/naen/plugins/release-copilot/scripts/release_copilot.py snapshot --repo . --format json
+```
+
+Use `artifacts` when the user wants files:
+
+```bash
+python3 /Users/naen/plugins/release-copilot/scripts/release_copilot.py artifacts \
+  --repo . \
+  --version 1.2.3 \
+  --tag v1.2.3 \
+  --output-dir release-artifacts
+```
+
+Use `changelog` for changelog entries. Print first, write only when asked:
+
+```bash
+python3 /Users/naen/plugins/release-copilot/scripts/release_copilot.py changelog \
+  --repo . \
+  --version 1.2.3 \
+  --tag v1.2.3
 ```
 
 ## Writing Polish
@@ -93,7 +117,8 @@ Before execution, check:
 - Release notes contain no secrets or private draft text.
 - `gh` is authenticated if creating a GitHub release.
 
+`apply --github-release` requires `--tag`. `apply --execute` refuses a dirty working tree unless `--allow-dirty` is passed.
+
 ## Response Handling
 
 When returning release artifacts, lead with the final artifact the user asked for. Keep command output summaries concise. Mention failed checks clearly and do not hide dirty working tree state.
-

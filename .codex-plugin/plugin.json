@@ -1,7 +1,7 @@
 {
   "name": "release-copilot",
-  "version": "0.1.0+codex.20260601070845",
-  "description": "Collect release context, run checks, and draft PR descriptions, changelogs, release notes, tags, and GitHub releases.",
+  "version": "0.2.0+codex.20260601073041",
+  "description": "Collect release context, recommend versions, run checks, and draft or write release artifacts.",
   "author": {
     "name": "Park Chanwoo",
     "url": "https://github.com/Meapri"
@@ -9,8 +9,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Release Copilot",
-    "shortDescription": "Draft and ship releases from local git context.",
-    "longDescription": "Release Copilot helps Codex collect local git context, summarize changes, run explicit verification commands, draft PR descriptions, changelog entries, release notes, tag commands, and GitHub release commands. It defaults to read-only draft mode and requires explicit execute flags for tags or GitHub releases.",
+    "shortDescription": "Plan, draft, and safely ship releases from git context.",
+    "longDescription": "Release Copilot helps Codex collect local git context, classify conventional commits, recommend the next semantic version, build GitHub compare links, run explicit verification commands, draft PR descriptions, changelog entries, release notes, tag commands, and GitHub release commands. It can write release artifact files and update changelogs, while defaulting to read-only draft mode and requiring explicit execute flags for tags or GitHub releases.",
     "developerName": "Park Chanwoo",
     "category": "Productivity",
     "capabilities": [

@@ -7,4 +7,4 @@ dist/
 build/
 *.egg-info/
 RELEASE_NOTES.md
-
+release-artifacts/
